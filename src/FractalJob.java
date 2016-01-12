@@ -3,6 +3,8 @@ import java.awt.image.BufferedImage;
 import java.awt.image.RenderedImage;
 import java.io.File;
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Random;
 import java.util.logging.FileHandler;
 
@@ -13,9 +15,11 @@ import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.IntWritable;
-import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.SequenceFile;
 import org.apache.hadoop.io.SequenceFile.CompressionType;
+import org.apache.hadoop.io.SequenceFile.Writer.Option;
+import org.apache.hadoop.io.Writable;
+import org.apache.hadoop.io.WritableComparable;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
 import org.apache.hadoop.mapreduce.Reducer;
@@ -33,75 +37,131 @@ public class FractalJob extends Configured implements Tool {
 	static private int imgSize;
 	static private String outputpath;
 
-
 	static FileHandler fh;
 
-	public static class RasterMapper extends Mapper<LongWritable, LongWritable, IntWritable, IntWritable> {
+	public static class RasterMapper extends Mapper<IntWritable, IntWritable, IntWritable, IntWritable> {
+		private int imageS;
+		private static Complex mapConstant;
+		
 
-		public void map(LongWritable begin, LongWritable end, Context context)
-				throws IOException, InterruptedException {
+		@Override
+		public void setup(Context context) throws IOException {
+			imageS = context.getConfiguration().getInt("image.size", -1);
+			
+			mapConstant = new Complex(context.getConfiguration().getDouble("constant.re", -1),
+					context.getConfiguration().getDouble("constant.im", -1));
 
+		}
+
+		@Override
+		public void map(IntWritable begin, IntWritable end, Context context) throws IOException, InterruptedException {
+		
+		
 			for (int x = (int) begin.get(); x < end.get(); x++) {
-				for (int y = 0; y < imgSize; y++) {
+				for (int y = 0; y < imageS; y++) {
 
 					float hue = 0, brighness = 0;
 					int icolor = 0;
-					Complex z = new Complex(2.0 * (x - imgSize / 2) / (imgSize / 2),
-							1.33 * (y - imgSize / 2) / (imgSize / 2));
+					Complex z = new Complex(2.0 * (x - imageS / 2) / (imageS / 2),
+							1.33 * (y - imageS / 2) / (imageS / 2));
+					
 					icolor = startCompute(generateZ(z), 0);
+				
 					if (icolor != -1) {
 						brighness = 1f;
 					}
-
+					
+					
 					hue = (icolor % 256) / 255.0f;
-
+					
 					Color color = Color.getHSBColor(hue, 1f, brighness);
-					context.write(new IntWritable(x + y * imgSize), new IntWritable(color.getRGB()));
+					try {
+						context.write(new IntWritable(x + y * imageS), new IntWritable(color.getRGB()));
+					} catch (Exception e) {
+						e.printStackTrace();
+					
+					}
+				
 				}
 			}
 
 		}
-	}
+		
 
-	public static class ImageGenerateReducer extends Reducer<IntWritable, IntWritable, IntWritable, IntWritable> {
-		public void reduce(IntWritable key, IntWritable values, Context context)
-				throws IOException, InterruptedException {
-			context.write(key, values);
+		private static Complex generateZ(Complex z) {
+			return (z.times(z)).plus(mapConstant);
 		}
-	}
 
-	private static Complex generateZ(Complex z) {
-		return (z.times(z)).plus(constant);
-	}
+		private static int startCompute(Complex z, int color) {
 
-	private static int startCompute(Complex z, int color) {
-
-		if (z.abs() > 4) {
-			return color;
-		} else if (color >= 256) {
-			return -1;
-		} else {
-			color = color + 1;
-			return startCompute(generateZ(z), color);
+			if (z.abs() > 4) {
+				return color;
+			} else if (color >= 255) {
+				return -1;
+			} else {
+				color = color + 1;
+				return startCompute(generateZ(z), color);
+			}
 		}
-	}
 
+	}
+	
+	public static class ImageReducer extends Reducer<IntWritable, IntWritable, WritableComparable<?>, Writable> {
+		private SequenceFile.Writer writer;
+
+		@Override
+		protected void cleanup(Context context) throws IOException, InterruptedException {
+			writer.close();
+		}
+		@Override
+		public void setup(Context context) throws IOException, InterruptedException {
+			Configuration conf = context.getConfiguration();
+			Path outDir = new Path(conf.get(FileOutputFormat.OUTDIR));
+			Path outFile = new Path(outDir, "pixels-out");
+		
+			Option optPath = SequenceFile.Writer.file(outFile);
+			Option optKey = SequenceFile.Writer.keyClass(IntWritable.class);
+			Option optVal = SequenceFile.Writer.valueClass(IntWritable.class);
+			Option optCom = SequenceFile.Writer.compression(CompressionType.NONE);
+			try {
+				writer = SequenceFile.createWriter(conf, optCom, optKey, optPath, optVal);
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+
+		}
+		@Override
+		public void reduce (IntWritable key,  Iterable<IntWritable>  value, Context context) throws IOException, InterruptedException {
+			
+				try{
+					
+					writer.append(key, value.iterator().next());
+				} catch (Exception e) {
+						e.printStackTrace();
+						
+				}
+			}
+		}
 	public static void generateFractal(int mapNr, Path filePath, Configuration conf)
 			throws IOException, ClassNotFoundException, InterruptedException {
+				
+		conf.setInt("image.size", imgSize);
+		conf.setDouble("constant.re", FractalJob.constant.re());
+		conf.setDouble("constant.im", FractalJob.constant.im());
 
 		Job job = Job.getInstance(conf);
 		job.setJobName(FractalJob.class.getSimpleName());
 
 		job.setJarByClass(FractalJob.class);
 		job.setInputFormatClass(SequenceFileInputFormat.class);
-
+		
 		job.setOutputKeyClass(IntWritable.class);
 		job.setOutputValueClass(IntWritable.class);
 		job.setOutputFormatClass(SequenceFileOutputFormat.class);
 
 		job.setMapperClass(RasterMapper.class);
 
-		job.setReducerClass(ImageGenerateReducer.class);
+		job.setReducerClass(ImageReducer.class);
 		job.setNumReduceTasks(1);
 
 		job.setSpeculativeExecution(false);
@@ -123,25 +183,26 @@ public class FractalJob extends Configured implements Tool {
 
 		try {
 			int offset = 0;
+		
 			// generate an input file for each map task
 			for (int i = 0; i < mapNr; ++i) {
-				
-				
+
 				final Path file = new Path(input, "part" + i);
-				
-				final LongWritable begin = new LongWritable(offset);
-				final LongWritable end = new LongWritable(offset + imgSize / mapNr);
+
+				final IntWritable begin = new IntWritable(offset);
+				final IntWritable end = new IntWritable(offset + imgSize / mapNr);
 				offset = (int) end.get();
-				
-				@SuppressWarnings("deprecation")
-				final SequenceFile.Writer writer = SequenceFile.createWriter(fs, conf, file, LongWritable.class,
-						LongWritable.class, CompressionType.NONE);
+
+				Option optPath = SequenceFile.Writer.file(file);
+				Option optKey = SequenceFile.Writer.keyClass(IntWritable.class);
+				Option optVal = SequenceFile.Writer.valueClass(IntWritable.class);
+				Option optCom = SequenceFile.Writer.compression(CompressionType.NONE);
+				SequenceFile.Writer writer = SequenceFile.createWriter(conf, optCom, optKey, optPath, optVal);
 				try {
 					writer.append(begin, end);
-					writer.hflush();
-				} catch (Exception e){ 
-						e.printStackTrace();
-				}finally {
+				} catch (Exception e) {
+					e.printStackTrace();
+				} finally {
 					writer.close();
 				}
 				System.out.println("Wrote input for Map #" + i);
@@ -149,50 +210,59 @@ public class FractalJob extends Configured implements Tool {
 
 			System.out.println("Starting Job");
 			final long startTime = System.currentTimeMillis();
-			job.waitForCompletion(true);
-			final double duration = (System.currentTimeMillis() - startTime) / 1000.0;
+		      job.waitForCompletion(true);
 			
-
-			// read outputs
+			
+			
 			System.out.println("Constructing image...");
+
+			Path file = new Path(output, "pixels-out");
+
+			org.apache.hadoop.io.SequenceFile.Reader.Option path = SequenceFile.Reader.file(file);
+
+			SequenceFile.Reader reader = new SequenceFile.Reader(conf, path);
 			IntWritable pxLoc = new IntWritable();
 			IntWritable color = new IntWritable();
-
-			Path file = new Path(output, "part-r-00000");
-			@SuppressWarnings("deprecation")
-			SequenceFile.Reader reader = new SequenceFile.Reader(fs, file, conf);
+			Map<Integer, Integer> colors = new HashMap<Integer,Integer>();
 			try {
 				BufferedImage image = new BufferedImage(imgSize, imgSize, BufferedImage.TYPE_INT_RGB);
+		
 				while (reader.next(pxLoc, color)) {
-					
-					for (int i = 0; i < imgSize; i++)
-						image.setRGB(i, (pxLoc.get() - i) / imgSize, color.get());
+						colors.put(pxLoc.get(), color.get());
+							
 				}
-				System.out.println(image.toString());
-				ImageIO.write((RenderedImage) image, "jpg", new File(FractalJob.outputpath));
-			}
-			catch (Exception e) {
+			
+				for (int i = 0; i < imgSize; i++) {
+					for (int j = 0; j < imgSize; j++) {
+						image.setRGB(i, j, colors.get(i+j*imgSize));
+					}
+				}
+				
+
+				
+				ImageIO.write( (RenderedImage) image, "png", new File(FractalJob.outputpath));
+			} catch (Exception e) {
 				e.printStackTrace();
-			}
-			 finally {
+			} finally {
 				reader.close();
 			}
+			final double duration = (System.currentTimeMillis() - startTime) / 1000.0;
 			System.out.println("Job Finished in " + duration + " seconds");
 		} finally {
-			
-			fs.delete(filePath, true);
-
-		}
+		fs.delete(filePath, true);
 		
+		}
 
 	}
 
-	public int run(String[] args) throws ClassNotFoundException, IOException, InterruptedException {
+	@Override
+	public int run(String[] args) throws Exception {
 		if (args.length != 5) {
-			System.err.println("Usage: " + getClass().getName() + " <Maps> <ImageSize> <Complex Re> <Complex Im> <Output path>");
-			ToolRunner.printGenericCommandUsage(System.err);
+			System.err
+					.println("Usage: " + "fractal.jar" + " <Maps> <ImageSize> <Complex Re> <Complex Im> <Output path>");
 			return 2;
 		}
+
 		final int mapNr = Integer.parseInt(args[0]);
 		FractalJob.imgSize = Integer.parseInt(args[1]);
 		FractalJob.constant = new Complex(Double.parseDouble(args[2]), Double.parseDouble(args[3]));
@@ -204,14 +274,13 @@ public class FractalJob extends Configured implements Tool {
 
 		System.out.println("Number of Maps  = " + mapNr);
 		generateFractal(mapNr, tmpDir, getConf());
-
 		return 0;
-
 	}
 
 	public static void main(String[] args) throws Exception {
 
-		System.exit(ToolRunner.run(null, new FractalJob(), args));
+		System.exit(ToolRunner.run(new Configuration(), new FractalJob(), args));
+
 	}
 
 }
